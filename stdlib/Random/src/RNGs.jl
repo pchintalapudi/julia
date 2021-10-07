@@ -24,15 +24,15 @@ else # !windows
     rand(rd::RandomDevice, ::SamplerType{Bool}) = read(getfile(rd), UInt8) % Bool
 
     function getfile(rd::RandomDevice)
-        devrandom = rd.unlimited ? DEV_URANDOM : DEV_RANDOM
-        # TODO: there is a data-race, this can leak up to nthreads() copies of the file descriptors,
-        # so use a "thread-once" utility once available
-        isassigned(devrandom) || (devrandom[] = open(rd.unlimited ? "/dev/urandom" : "/dev/random"))
-        devrandom[]
+        devrandom = (rd.unlimited ? DEV_URANDOM : DEV_RANDOM)[]
+        if devrandom === nothing
+            error("The requested form of random stream is not available")
+        end
+        devrandom
     end
 
-    const DEV_RANDOM  = Ref{IOStream}()
-    const DEV_URANDOM = Ref{IOStream}()
+    const DEV_RANDOM  = Ref{Union{IOStream,Nothing}}()
+    const DEV_URANDOM = Ref{Union{IOStream,Nothing}}()
 
 end # os-test
 
@@ -411,6 +411,18 @@ for T in BitInteger_types
 end
 
 function __init__()
+    @static if !Sys.iswindows()
+        DEV_RANDOM[] = try
+            open("/dev/random")
+        catch
+            nothing
+        end
+        DEV_URANDOM[] = try
+            open("/dev/urandom")
+        catch
+            nothing
+        end
+    end
     seed!(GLOBAL_RNG)
 end
 
