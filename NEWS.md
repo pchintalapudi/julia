@@ -118,6 +118,12 @@ Standard library changes
 * The standard log levels `BelowMinLevel`, `Debug`, `Info`, `Warn`, `Error`,
   and `AboveMaxLevel` are now exported from the Logging stdlib ([#40980]).
 
+### Unicode
+* The `Unicode.normalize` function now accepts a `charmap` keyword that can
+  be used to supply custom character mappings, and a `Unicode.julia_charmap`
+  function is provided to reproduce the mapping used in identifier normalization
+  by the Julia parser ([#42561]).
+
 
 Deprecated or removed
 ---------------------
