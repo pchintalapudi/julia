@@ -1496,6 +1496,7 @@ LIBGCC_NAME := libgcc_s_sjlj-1.$(SHLIB_EXT)
 else
 LIBGCC_NAME := libgcc_s_seh-1.$(SHLIB_EXT)
 endif
+LIBZ_NAME := libz.$(SHLIB_EXT)
 endif
 ifeq ($(OS),Darwin)
 ifeq ($(ARCH),aarch64)
@@ -1503,9 +1504,11 @@ LIBGCC_NAME := libgcc_s.2.$(SHLIB_EXT)
 else
 LIBGCC_NAME := libgcc_s.1.$(SHLIB_EXT)
 endif
+LIBZ_NAME := libz.1.$(SHLIB_EXT)
 endif
 ifneq ($(findstring $(OS),Linux FreeBSD),)
 LIBGCC_NAME := libgcc_s.$(SHLIB_EXT).1
+LIBZ_NAME := libz.$(SHLIB_EXT).1
 endif
 
 # USE_SYSTEM_CSL causes it to get symlinked into build_private_shlibdir
@@ -1515,6 +1518,14 @@ else
 LIBGCC_BUILD_DEPLIB := $(call dep_lib_path,$(build_libdir),$(build_shlibdir)/$(LIBGCC_NAME))
 endif
 LIBGCC_INSTALL_DEPLIB := $(call dep_lib_path,$(libdir),$(private_shlibdir)/$(LIBGCC_NAME))
+
+# USE_SYSTEM_ZLIB causes it to get symlinked into build_private_shlibdir
+ifeq ($(USE_SYSTEM_ZLIB),1)
+LIBZ := $(call dep_lib_path,$(build_libdir),$(build_private_shlibdir)/$(LIBZ_NAME))
+else
+LIBZ_BUILD_DEPLIB := $(call dep_lib_path,$(build_libdir),$(build_shlibdir)/$(LIBZ_NAME))
+endif
+LIBZ_INSTALL_DEPLIB := $(call dep_lib_path,$(libdir),$(private_shlibdir)/$(LIBZ_NAME))
 
 # USE_SYSTEM_LIBM and USE_SYSTEM_OPENLIBM causes it to get symlinked into build_private_shlibdir
 ifeq ($(USE_SYSTEM_LIBM),1)
@@ -1535,10 +1546,10 @@ LIBM_INSTALL_DEPLIB := $(call dep_lib_path,$(libdir),$(private_shlibdir)/$(LIBMN
 #  * debug builds must link against libjuliadebug, not libjulia
 #  * install time relative paths are not equal to build time relative paths (../lib vs. ../lib/julia)
 # That second point will no longer be true for most deps once they are placed within Artifacts directories.
-LOADER_BUILD_DEP_LIBS = $(LIBGCC_BUILD_DEPLIB):$(LIBM_BUILD_DEPLIB):$(LIBJULIAINTERNAL_BUILD_DEPLIB)
-LOADER_DEBUG_BUILD_DEP_LIBS = $(LIBGCC_BUILD_DEPLIB):$(LIBM_BUILD_DEPLIB):$(LIBJULIAINTERNAL_DEBUG_BUILD_DEPLIB)
-LOADER_INSTALL_DEP_LIBS = $(LIBGCC_INSTALL_DEPLIB):$(LIBM_INSTALL_DEPLIB):$(LIBJULIAINTERNAL_INSTALL_DEPLIB)
-LOADER_DEBUG_INSTALL_DEP_LIBS = $(LIBGCC_INSTALL_DEPLIB):$(LIBM_INSTALL_DEPLIB):$(LIBJULIAINTERNAL_DEBUG_INSTALL_DEPLIB)
+LOADER_BUILD_DEP_LIBS = $(LIBGCC_BUILD_DEPLIB):$(LIBM_BUILD_DEPLIB):$(LIBZ_BUILD_DEPLIB):$(LIBJULIAINTERNAL_BUILD_DEPLIB)
+LOADER_DEBUG_BUILD_DEP_LIBS = $(LIBGCC_BUILD_DEPLIB):$(LIBM_BUILD_DEPLIB):$(LIBZ_BUILD_DEPLIB):$(LIBJULIAINTERNAL_DEBUG_BUILD_DEPLIB)
+LOADER_INSTALL_DEP_LIBS = $(LIBGCC_INSTALL_DEPLIB):$(LIBM_INSTALL_DEPLIB):$(LIBZ_INSTALL_DEPLIB):$(LIBJULIAINTERNAL_INSTALL_DEPLIB)
+LOADER_DEBUG_INSTALL_DEP_LIBS = $(LIBGCC_INSTALL_DEPLIB):$(LIBM_INSTALL_DEPLIB):$(LIBZ_INSTALL_DEPLIB):$(LIBJULIAINTERNAL_DEBUG_INSTALL_DEPLIB)
 
 # Colors for make
 ifndef VERBOSE
