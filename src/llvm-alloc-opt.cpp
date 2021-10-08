@@ -10,6 +10,7 @@
 #include <llvm/ADT/SmallSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SetVector.h>
+#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -107,7 +108,9 @@ private:
     {
         FunctionPass::getAnalysisUsage(AU);
         AU.addRequired<DominatorTreeWrapperPass>();
+        AU.addRequired<PostDominatorTreeWrapperPass>();
         AU.addPreserved<DominatorTreeWrapperPass>();
+        AU.addPreserved<PostDominatorTreeWrapperPass>();
         AU.setPreservesCFG();
     }
 };
@@ -123,6 +126,7 @@ struct Optimizer {
     bool finalize();
 private:
     bool isSafepoint(Instruction *inst);
+    bool isAllocationEquivalent(CallInst *alloc1, CallInst *alloc2);
     Instruction *getFirstSafepoint(BasicBlock *bb);
     ssize_t getGCAllocSize(Instruction *I);
     void pushInstruction(Instruction *I);
@@ -139,10 +143,13 @@ private:
     void moveToStack(CallInst *orig_inst, size_t sz, bool has_ref);
     void splitOnStack(CallInst *orig_inst);
     void optimizeTag(CallInst *orig_inst);
+    void coalescePhi(CallInst *orig_inst, llvm::PHINode *phi);
+    void doCoalesce(llvm::PHINode *phi);
 
     Function &F;
     AllocOpt &pass;
     DominatorTree *_DT = nullptr;
+    PostDominatorTree *_PDT = nullptr;
 
     DominatorTree &getDomTree()
     {
@@ -150,6 +157,14 @@ private:
             _DT = &pass.getAnalysis<DominatorTreeWrapperPass>().getDomTree();
         return *_DT;
     }
+
+    PostDominatorTree &getPostDomTree()
+    {
+        if (!_PDT)
+            _PDT = &pass.getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+        return *_PDT;
+    }
+
     struct Lifetime {
         struct Frame {
             BasicBlock *bb;
@@ -182,6 +197,11 @@ private:
         typedef SmallVector<Frame,4> Stack;
     };
 
+    struct AllocPHIInfo {
+        CallInst *alloc;
+        llvm::SmallSet<llvm::Instruction*,16> uses;
+    };
+
     SetVector<std::pair<CallInst*,size_t>> worklist;
     SmallVector<CallInst*,6> removed;
     AllocUseInfo use_info;
@@ -189,6 +209,7 @@ private:
     Lifetime::Stack lifetime_stack;
     ReplaceUses::Stack replace_stack;
     std::map<BasicBlock*, llvm::WeakVH> first_safepoint;
+    std::map<llvm::PHINode*, llvm::SmallVector<AllocPHIInfo, 2>> to_coalesce;
 };
 
 void Optimizer::pushInstruction(Instruction *I)
@@ -218,8 +239,11 @@ void Optimizer::optimizeAll()
         if (use_info.escaped) {
             if (use_info.hastypeof)
                 optimizeTag(orig);
+            if (use_info.phiuse)
+                coalescePhi(orig, use_info.phiuse);
             continue;
         }
+        assert(!use_info.phiuse);
         if (!use_info.addrescaped && !use_info.hasload && (!use_info.haspreserve ||
                                                            !use_info.refstore)) {
             // No one took the address, no one reads anything and there's no meaningful
@@ -1135,6 +1159,116 @@ cleanup:
             continue;
         PromoteMemToReg({slot.slot}, getDomTree());
     }
+}
+
+bool Optimizer::isAllocationEquivalent(CallInst *alloc1, CallInst *alloc2) {
+    assert(alloc1->getCalledOperand() == pass.alloc_obj_func);
+    assert(alloc2->getCalledOperand() == pass.alloc_obj_func);
+    if (alloc1->getNumOperands() != alloc2->getNumOperands()) {
+        return false;
+    }
+    //Notice that we don't care about the PTLS source here (we skip arg 0)
+    for (std::size_t i = 1; i < alloc1->getNumOperands(); i++) {
+        auto val1 = alloc1->getOperand(i), val2 = alloc2->getOperand(i);
+        //99% of the time the allocations are going to have constant operands
+        //Otherwise we are conservative and just go with pointer equality
+        auto c1 = dyn_cast<ConstantInt>(val1), c2 = dyn_cast<ConstantInt>(val2);
+        if (c1 && c2) {
+            if (c1->getValue() != c2->getValue()) {
+                return false;
+            }
+        } else if (val1 != val2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
+    //We can't coalesce more than 2 allocations at a time because
+    //we'd have to be certain that all of the allocations do not
+    //overlap
+    //There might be room for partial coalescing of allocations
+    //that does not end up removing the phi node, but we don't
+    //do that here
+    if (phi->getNumOperands() != 2) {
+        return;
+    }
+    // dbgs() << "Phi node " << *phi << " has 2 operands\n";
+    auto &aphiInfo = to_coalesce[phi];
+    //If we've already seen the other half and rejected this, skip now
+    if (!aphiInfo.empty()) {
+        // dbgs() << "Looking at second half of phi node\n";
+        // dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n";
+        // if (aphiInfo[0].alloc) {
+        //     dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n";
+        //     dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n";
+        // }
+        if (!aphiInfo[0].alloc || !isAllocationEquivalent(aphiInfo[0].alloc, orig_inst)) {
+            to_coalesce.erase(phi);
+            return;
+        }
+    }
+    auto &pdt = getPostDomTree();
+    for (const auto &use : use_info.uses) {
+        if (use != phi && !pdt.dominates(phi, use)) {
+            // dbgs() << "postdomination failure\n";
+            //Reject because the phi node must postdominate all other uses
+            if (!aphiInfo.empty()) {
+                //The other half has already been processed
+                to_coalesce.erase(phi);
+            } else {
+                //We need to signal the other half of the phi node to skip
+                aphiInfo.push_back({nullptr, {}});
+            }
+            return;
+        }
+    }
+    if (aphiInfo.empty()) {
+        // dbgs() << "Waiting for other half\n";
+        //Save the current info so that we can use it when coalescing
+        aphiInfo.push_back({orig_inst, use_info.uses});
+        return;
+    }
+    //Figure out which is the dominating caller
+    CallInst *dominator, *not_dominator;
+    decltype(AllocPHIInfo::uses) *dominator_info;
+    auto &dt = getDomTree();
+    if (dt.dominates(orig_inst, aphiInfo[0].alloc)) {
+        dominator = orig_inst;
+        not_dominator = aphiInfo[0].alloc;
+        dominator_info = &use_info.uses;
+    } else if (dt.dominates(aphiInfo[0].alloc, orig_inst)) {
+        dominator = aphiInfo[0].alloc;
+        not_dominator = orig_inst;
+        dominator_info = &aphiInfo[0].uses;
+    } else {
+        // dbgs() << "Non-dominating allocation\n";
+        //One of the allocations must dominate the other
+        //This is to give an obvious allocation to coalesce into
+        //simplifycfg has been shown to coalesce phi nodes with
+        //allocations where there is no obvious dominator
+        to_coalesce.erase(phi);
+        return;
+    }
+    for (const auto &use : *dominator_info) {
+        if (use != phi && !dt.dominates(use, not_dominator)) {
+            // dbgs() << "Non-dominating instruction\n";
+            //We want to reuse an allocation here, but we
+            //need to prove that there is no way to access
+            //the old data without going through the phi
+            //node
+            //Getting to this line means we have violated
+            //that rule, so we can't coalesce the node
+            to_coalesce.erase(phi);
+            return;
+        }
+    }
+    // dbgs() << "Will coalesce\n"
+    //We're going to coalesce, we don't need that information anymore
+    to_coalesce.erase(phi);
+    not_dominator->replaceAllUsesWith(dominator);
+    removed.push_back(not_dominator);
 }
 
 bool AllocOpt::doInitialization(Module &M)

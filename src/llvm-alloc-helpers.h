@@ -60,6 +60,8 @@ namespace jl_alloc {
         llvm::SmallSet<llvm::Instruction*,16> uses;
         llvm::SmallSet<llvm::CallInst*,4> preserves;
         std::map<uint32_t,Field> memops;
+        // A single coalesceable phi node that uses this allocation
+        llvm::PHINode *phiuse;
         // Completely unknown use
         bool escaped:1;
         // Address is leaked to functions that doesn't care where the object is allocated.
@@ -82,6 +84,7 @@ namespace jl_alloc {
         bool hasunknownmem:1;
         void reset()
         {
+            phiuse = nullptr;
             escaped = false;
             addrescaped = false;
             hasload = false;

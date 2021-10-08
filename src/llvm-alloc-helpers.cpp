@@ -169,6 +169,18 @@ JL_USED_FUNC void AllocUseInfo::dump()
     }
 }
 
+//Dealing with PHI nodes
+//Allocations that are used by PHI nodes may form nontrivial usage relationships
+//through the control flow graph. Thus, we are limited in what we can do when PHI
+//nodes select one allocation or another. However, we can 'coalesce' a pair of allocations
+//that are subsequently selected by a PHI node into a single allocation that is
+//hoisted and simply written to by the code in question. This can be done only when the
+//allocation does not escape except possibly through the PHI node in question.
+//We still count the PHI node as an escape because they bring in unneeded complexity.
+//This should be at least partially mitigated by the fact that coalescing allows PHI nodes
+//to be removed altogether, so theoretically repeated coalescing should remove small
+//trees of PHI nodes and thus remove the 'escaping' instruction.
+
 void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stack &check_stack, JuliaPassContext &pass, const DataLayout &DL, const llvm::SmallPtrSetImpl<const llvm::BasicBlock*> *valid_set) {
     use_info.reset();
     if (I->use_empty())
@@ -184,6 +196,8 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
         cur.use_it = inst->use_begin();
         cur.use_end = inst->use_end();
     };
+
+    PHINode *phiuse = nullptr;
 
     auto check_inst = [&] (Instruction *inst, Use *use) {
         if (isa<LoadInst>(inst)) {
@@ -295,6 +309,19 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
             cur.offset = (uint32_t)next_offset;
             return true;
         }
+        if (auto phi = dyn_cast<PHINode>(inst)) {
+            if (phiuse) {
+                //We have multiple phi nodes on the same allocation,
+                //cannot optimize either away.
+                phiuse = nullptr;
+                use_info.escaped = true;
+                return false;
+            }
+            //The phi causes an escape, but we'll deal with the one phi
+            //separately
+            phiuse = phi;
+            return true;
+        }
         use_info.escaped = true;
         return false;
     };
@@ -314,8 +341,11 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
             use_info.uses.insert(inst);
         }
         if (cur.use_it == cur.use_end) {
-            if (check_stack.empty())
+            if (check_stack.empty()) {
+                use_info.phiuse = phiuse;
+                use_info.escaped = use_info.escaped || phiuse;
                 return;
+            }
             cur = check_stack.back();
             check_stack.pop_back();
         }
