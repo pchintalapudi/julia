@@ -12,10 +12,7 @@ ifeq ($(USEICC), 1)
 UV_CFLAGS += -static-intel
 endif
 
-UV_FLAGS := LDFLAGS="$(LDFLAGS) $(CLDFLAGS) -v"
-ifneq ($(UV_CFLAGS),)
-UV_FLAGS += CFLAGS="$(CFLAGS) $(UV_CFLAGS)"
-endif
+UV_FLAGS += CFLAGS="$(CFLAGS) $(UV_CFLAGS) $(SANITIZE_OPTS)"
 ifeq ($(USEMSVC), 1)
 UV_FLAGS += --disable-shared
 endif
@@ -26,6 +23,9 @@ endif
 
 LIBUV_BUILDDIR := $(BUILDDIR)/$(LIBUV_SRC_DIR)
 
+ifneq ($(CLDFLAGS)$(SANITIZE_LDFLAGS),)
+$(LIBUV_BUILDDIR)/build-configured: LDFLAGS:=$(LDFLAGS) $(CLDFLAGS) $(SANITIZE_LDFLAGS)
+endif
 $(LIBUV_BUILDDIR)/build-configured: $(SRCCACHE)/$(LIBUV_SRC_DIR)/source-extracted
 	touch -c $(SRCCACHE)/$(LIBUV_SRC_DIR)/aclocal.m4 # touch a few files to prevent autogen from getting called
 	touch -c $(SRCCACHE)/$(LIBUV_SRC_DIR)/Makefile.in
