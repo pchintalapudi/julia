@@ -119,8 +119,8 @@ Standard library changes
   and `AboveMaxLevel` are now exported from the Logging stdlib ([#40980]).
 
 ### Unicode
-* The `Unicode.normalize` function now accepts a `charmap` keyword that can
-  be used to supply custom character mappings, and a `Unicode.julia_charmap`
+* The `Unicode.normalize` function now accepts a `chartransform` keyword that can
+  be used to supply custom character mappings, and a `Unicode.julia_chartransform`
   function is provided to reproduce the mapping used in identifier normalization
   by the Julia parser ([#42561]).
 
