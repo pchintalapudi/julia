@@ -1194,16 +1194,16 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     if (phi->getNumOperands() != 2) {
         return;
     }
-    // dbgs() << "Phi node " << *phi << " has 2 operands\n";
+    dbgs() << "Phi node " << *phi << " has 2 operands\n";
     auto &aphiInfo = to_coalesce[phi];
     //If we've already seen the other half and rejected this, skip now
     if (!aphiInfo.empty()) {
-        // dbgs() << "Looking at second half of phi node\n";
-        // dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n";
-        // if (aphiInfo[0].alloc) {
-        //     dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n";
-        //     dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n";
-        // }
+        dbgs() << "Looking at second half of phi node\n";
+        dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n";
+        if (aphiInfo[0].alloc) {
+            dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n";
+            dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n";
+        }
         if (!aphiInfo[0].alloc || !isAllocationEquivalent(aphiInfo[0].alloc, orig_inst)) {
             to_coalesce.erase(phi);
             return;
@@ -1212,7 +1212,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     auto &pdt = getPostDomTree();
     for (const auto &use : use_info.uses) {
         if (use != phi && !pdt.dominates(phi, use)) {
-            // dbgs() << "postdomination failure\n";
+            dbgs() << "postdomination failure\n";
             //Reject because the phi node must postdominate all other uses
             if (!aphiInfo.empty()) {
                 //The other half has already been processed
@@ -1225,7 +1225,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         }
     }
     if (aphiInfo.empty()) {
-        // dbgs() << "Waiting for other half\n";
+        dbgs() << "Waiting for other half\n";
         //Save the current info so that we can use it when coalescing
         aphiInfo.push_back({orig_inst, use_info.uses});
         return;
@@ -1243,7 +1243,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         not_dominator = orig_inst;
         dominator_info = &aphiInfo[0].uses;
     } else {
-        // dbgs() << "Non-dominating allocation\n";
+        dbgs() << "Non-dominating allocation\n";
         //One of the allocations must dominate the other
         //This is to give an obvious allocation to coalesce into
         //simplifycfg has been shown to coalesce phi nodes with
@@ -1253,7 +1253,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     }
     for (const auto &use : *dominator_info) {
         if (use != phi && !dt.dominates(use, not_dominator)) {
-            // dbgs() << "Non-dominating instruction\n";
+            dbgs() << "Non-dominating instruction\n";
             //We want to reuse an allocation here, but we
             //need to prove that there is no way to access
             //the old data without going through the phi
@@ -1264,9 +1264,11 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
             return;
         }
     }
-    // dbgs() << "Will coalesce\n"
+    dbgs() << "Will coalesce\n";
     //We're going to coalesce, we don't need that information anymore
     to_coalesce.erase(phi);
+    llvm::IRBuilder<> builder{not_dominator};
+    builder.CreateMemSet(emit_bitcast_with_builder(builder, dominator, pass.T_pint8), ConstantInt::get(pass.T_int8, 0), dominator->getArgOperand(1), MaybeAlign(0));
     not_dominator->replaceAllUsesWith(dominator);
     removed.push_back(not_dominator);
 }
