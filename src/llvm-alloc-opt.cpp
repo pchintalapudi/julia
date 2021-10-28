@@ -41,6 +41,8 @@
 using namespace llvm;
 using namespace jl_alloc;
 
+#define LLVM_DEBUG(x) x
+
 namespace {
 
 static void removeGCPreserve(CallInst *call, Instruction *val)
@@ -1194,15 +1196,15 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     if (phi->getNumOperands() != 2) {
         return;
     }
-    dbgs() << "Phi node " << *phi << " has 2 operands\n";
+    LLVM_DEBUG(dbgs() << "Phi node " << *phi << " has 2 operands\n");
     auto &aphiInfo = to_coalesce[phi];
     //If we've already seen the other half and rejected this, skip now
     if (!aphiInfo.empty()) {
-        dbgs() << "Looking at second half of phi node\n";
-        dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n";
+        LLVM_DEBUG(dbgs() << "Looking at second half of phi node\n");
+        LLVM_DEBUG(dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n");
         if (aphiInfo[0].alloc) {
-            dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n";
-            dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n";
+            LLVM_DEBUG(dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n");
+            LLVM_DEBUG(dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n");
         }
         if (!aphiInfo[0].alloc || !isAllocationEquivalent(aphiInfo[0].alloc, orig_inst)) {
             to_coalesce.erase(phi);
@@ -1212,7 +1214,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     auto &pdt = getPostDomTree();
     for (const auto &use : use_info.uses) {
         if (use != phi && !pdt.dominates(phi, use)) {
-            dbgs() << "postdomination failure\n";
+            LLVM_DEBUG(dbgs() << "postdomination failure\n");
             //Reject because the phi node must postdominate all other uses
             if (!aphiInfo.empty()) {
                 //The other half has already been processed
@@ -1225,7 +1227,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         }
     }
     if (aphiInfo.empty()) {
-        dbgs() << "Waiting for other half\n";
+        LLVM_DEBUG(dbgs() << "Waiting for other half\n");
         //Save the current info so that we can use it when coalescing
         aphiInfo.push_back({orig_inst, use_info.uses});
         return;
@@ -1243,7 +1245,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         not_dominator = orig_inst;
         dominator_info = &aphiInfo[0].uses;
     } else {
-        dbgs() << "Non-dominating allocation\n";
+        LLVM_DEBUG(dbgs() << "Non-dominating allocation\n");
         //One of the allocations must dominate the other
         //This is to give an obvious allocation to coalesce into
         //simplifycfg has been shown to coalesce phi nodes with
@@ -1253,7 +1255,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     }
     for (const auto &use : *dominator_info) {
         if (use != phi && !dt.dominates(use, not_dominator)) {
-            dbgs() << "Non-dominating instruction\n";
+            LLVM_DEBUG(dbgs() << "Non-dominating instruction\n");
             //We want to reuse an allocation here, but we
             //need to prove that there is no way to access
             //the old data without going through the phi
@@ -1264,7 +1266,7 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
             return;
         }
     }
-    dbgs() << "Will coalesce\n";
+    LLVM_DEBUG(dbgs() << "Will coalesce\n");
     //We're going to coalesce, we don't need that information anymore
     to_coalesce.erase(phi);
     llvm::IRBuilder<> builder{not_dominator};
