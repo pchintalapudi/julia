@@ -41,8 +41,6 @@
 using namespace llvm;
 using namespace jl_alloc;
 
-#define LLVM_DEBUG(x) x
-
 namespace {
 
 static void removeGCPreserve(CallInst *call, Instruction *val)
@@ -1169,7 +1167,7 @@ bool Optimizer::isAllocationEquivalent(CallInst *alloc1, CallInst *alloc2) {
     if (alloc1->getNumOperands() != alloc2->getNumOperands()) {
         return false;
     }
-    //Notice that we don't care about the PTLS source here (we skip arg 0)
+    //We don't care about the PTLS source here (we skip arg 0)
     for (std::size_t i = 1; i < alloc1->getNumOperands(); i++) {
         auto val1 = alloc1->getOperand(i), val2 = alloc2->getOperand(i);
         //99% of the time the allocations are going to have constant operands
@@ -1186,25 +1184,50 @@ bool Optimizer::isAllocationEquivalent(CallInst *alloc1, CallInst *alloc2) {
     return true;
 }
 
+//Our goal with this function is to coalesce the following types of allocations
+/*
+A:
+    %0 = alloc
+    store 0, %0
+    %1 = cond
+    br %1, B, C
+B:
+    %2 = alloc
+    store 1, %2
+    br C
+C:
+    %3 = phi [%0, A], [%2, B]
+    ...
+*/
+//into one that drops an allocation
+/*
+A:
+    %0 = alloc
+    store 0, %0
+    %1 = cond
+    br %1, B, C
+B:
+    memset(%0, 0, sizeof(%0))
+    store 1, %0
+    br C
+C:
+    %3 = phi [%0, A], [%0, B]
+    ...
+*/
+//By removing the allocation from B, we trivially reduce
+//memory pressure for some functions. Furthermore, if those
+//allocations are within a loop, we open up more loop
+//optimizations such as vectorization and loop deletion
+//due to the complicating factor of the allocation no longer
+//being present in the loop.
 void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     //We can't coalesce more than 2 allocations at a time because
     //we'd have to be certain that all of the allocations do not
     //overlap
-    //There might be room for partial coalescing of allocations
-    //that does not end up removing the phi node, but we don't
-    //do that here
-    if (phi->getNumOperands() != 2) {
-        return;
-    }
-    LLVM_DEBUG(dbgs() << "Phi node " << *phi << " has 2 operands\n");
     auto &aphiInfo = to_coalesce[phi];
     //If we've already seen the other half and rejected this, skip now
     if (!aphiInfo.empty()) {
-        LLVM_DEBUG(dbgs() << "Looking at second half of phi node\n");
-        LLVM_DEBUG(dbgs() << "alloc: " << !!aphiInfo[0].alloc << "\n");
         if (aphiInfo[0].alloc) {
-            LLVM_DEBUG(dbgs() << "alloc1: " << *aphiInfo[0].alloc << "; alloc2: " << *orig_inst << ";\n");
-            LLVM_DEBUG(dbgs() << "alloc_equiv: " << isAllocationEquivalent(aphiInfo[0].alloc, orig_inst) << "\n");
         }
         if (!aphiInfo[0].alloc || !isAllocationEquivalent(aphiInfo[0].alloc, orig_inst)) {
             to_coalesce.erase(phi);
@@ -1214,7 +1237,6 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     auto &pdt = getPostDomTree();
     for (const auto &use : use_info.uses) {
         if (use != phi && !pdt.dominates(phi, use)) {
-            LLVM_DEBUG(dbgs() << "postdomination failure\n");
             //Reject because the phi node must postdominate all other uses
             if (!aphiInfo.empty()) {
                 //The other half has already been processed
@@ -1227,7 +1249,6 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         }
     }
     if (aphiInfo.empty()) {
-        LLVM_DEBUG(dbgs() << "Waiting for other half\n");
         //Save the current info so that we can use it when coalescing
         aphiInfo.push_back({orig_inst, use_info.uses});
         return;
@@ -1245,7 +1266,6 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
         not_dominator = orig_inst;
         dominator_info = &aphiInfo[0].uses;
     } else {
-        LLVM_DEBUG(dbgs() << "Non-dominating allocation\n");
         //One of the allocations must dominate the other
         //This is to give an obvious allocation to coalesce into
         //simplifycfg has been shown to coalesce phi nodes with
@@ -1255,7 +1275,6 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
     }
     for (const auto &use : *dominator_info) {
         if (use != phi && !dt.dominates(use, not_dominator)) {
-            LLVM_DEBUG(dbgs() << "Non-dominating instruction\n");
             //We want to reuse an allocation here, but we
             //need to prove that there is no way to access
             //the old data without going through the phi
@@ -1266,7 +1285,51 @@ void Optimizer::coalescePhi(CallInst *orig_inst, PHINode *phi) {
             return;
         }
     }
-    LLVM_DEBUG(dbgs() << "Will coalesce\n");
+    //Finally, there is a problem when dealing with backedges
+    //Specifically the following code:
+    /*
+    A:
+        %0 = alloc
+        store 0, %0
+        %1 = cond
+        br %1, B, C
+    B:
+        %2 = phi [%0, A], [%4, C]
+        call @escape(%2)
+        %3 = cond2
+        br %3 C, undef
+    C:
+        %4 = alloc
+        store 1, %0
+        br B
+    */
+    //with the following CFG:
+    /*
+    A
+    |--
+    B |
+    | |
+    C--
+    */
+    //then up to this point we have no reason to not coalesce the phi node
+    //because the phi node %2 postdominates %0 and its uses, and postdominates
+    //%4 and its uses. Furthermore, %0 dominates %2. However, if @escape stores
+    //%2 in an array, then coalescing %4 into %0 will result in storing the same
+    //copy of the object n times in the array, rather than n different objects.
+    //The problem stems from the edge of B --> C; that is, if an edge after the
+    //phi node escapes connects to the non-dominating allocation without passing through
+    //the dominating allocation, then we cannot assume that the phi node may escape
+    //without consequence. In the absence of a good method to detect such edges,
+    //we simply assert that the phi node does not escape under any circumstance.
+    //The one exception to this rule is if the escape is a ReturnInst, because we
+    //can guarantee that there will be no edges after this particular escape.
+
+    //We're done using use_info, so we can just clobber use_info to check if the phi escapes
+    jl_alloc::checkInst(use_info, phi, check_stack, pass, *pass.DL);
+    if (use_info.escaped) {
+        to_coalesce.erase(phi);
+        return;
+    }
     //We're going to coalesce, we don't need that information anymore
     to_coalesce.erase(phi);
     llvm::IRBuilder<> builder{not_dominator};

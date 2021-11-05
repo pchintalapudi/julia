@@ -197,6 +197,7 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
         cur.use_end = inst->use_end();
     };
 
+    bool checking_phi = isa<PHINode>(I);
     PHINode *phiuse = nullptr;
 
     auto check_inst = [&] (Instruction *inst, Use *use) {
@@ -310,9 +311,11 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
             return true;
         }
         if (auto phi = dyn_cast<PHINode>(inst)) {
-            if (phiuse) {
+            if (phiuse || checking_phi) {
                 //We have multiple phi nodes on the same allocation,
                 //cannot optimize either away.
+                //Alternatively, we've already passed through one phi node, so
+                //any encountered phi node is an escape (including itself)
                 phiuse = nullptr;
                 use_info.escaped = true;
                 return false;
@@ -320,6 +323,10 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
             //The phi causes an escape, but we'll deal with the one phi
             //separately
             phiuse = phi;
+            return true;
+        }
+        if (isa<ReturnInst>(inst) && checking_phi) {
+            //Return instructions don't fail phi node escape analysis
             return true;
         }
         use_info.escaped = true;
@@ -342,7 +349,7 @@ void jl_alloc::checkInst(AllocUseInfo &use_info, Instruction *I, CheckInst::Stac
         }
         if (cur.use_it == cur.use_end) {
             if (check_stack.empty()) {
-                use_info.phiuse = phiuse;
+                use_info.phiuse = use_info.escaped || use_info.addrescaped || use_info.hasunknownmem ? nullptr : phiuse;
                 use_info.escaped = use_info.escaped || phiuse;
                 return;
             }
