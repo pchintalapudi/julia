@@ -118,7 +118,16 @@ namespace jl_alloc {
     struct EscapeAnalysisRequiredArgs {
         AllocUseInfo &use_info; // The returned escape analysis data
         CheckInst::Stack &check_stack; // A preallocated stack to be used for escape analysis
-        JuliaPassContext &pass; // The current optimization pass (for accessing intrinsic functions)
+        struct Intrinsics {
+            llvm::Function *gc_preserve_begin_func;
+            llvm::Function *pointer_from_objref_func;
+            llvm::Function *typeof_func;
+            llvm::Function *write_barrier_func;
+
+            Intrinsics() = default;
+            explicit Intrinsics(JuliaPassContext &pass);
+            explicit Intrinsics(llvm::Module &m);
+        } intrinsics;
         const llvm::DataLayout &DL; // The module's data layout (for handling GEPs/memory operations)
     };
 

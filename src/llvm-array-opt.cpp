@@ -33,19 +33,26 @@ namespace {
         int dimcount;
     };
 
-    struct ArrayOpt;
-
+    template<typename DomTreeGetter>
     struct Optimizer {
-        ArrayOpt *pass;
+        jl_alloc::EscapeAnalysisRequiredArgs::Intrinsics intrinsics;
+        DomTreeGetter get_dtree;
         const DataLayout *DL;
         SmallVector<ArrayAllocation, 4> array_allocations;
         std::map<Value *, SmallSet<std::size_t, 2>> lengths;
 
-        Optimizer(ArrayOpt *pass) : pass(pass) {}
+        Optimizer(decltype(intrinsics) intrinsics, DomTreeGetter dtree_getter) : intrinsics(intrinsics), get_dtree(dtree_getter) {}
 
         void initializeAllocations(Function &F);
         bool propagate1DArrayLengths();
         bool optimizeCmpInsts();
+
+        bool runOnFunction(Function &F) {
+            initializeAllocations(F);
+            bool propagation_changed = propagate1DArrayLengths();
+            bool cmp_folded = optimizeCmpInsts();
+            return propagation_changed || cmp_folded;
+        }
 
         void reset() {
             array_allocations.clear();
@@ -53,18 +60,31 @@ namespace {
         }
     };
 
-    struct ArrayOpt : public FunctionPass, public JuliaPassContext {
+    struct ArrayOpt : public PassInfoMixin<ArrayOpt> {
+        PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
+            auto dtree_getter = [&]() -> decltype(auto) { return AM.getResult<llvm::DominatorTreeAnalysis>(F); };
+            Optimizer<decltype(dtree_getter)> optimizer(jl_alloc::EscapeAnalysisRequiredArgs::Intrinsics(*F.getParent()), dtree_getter);
+            if (!optimizer.runOnFunction(F)) {
+                return PreservedAnalyses::all();
+            } else {
+                PreservedAnalyses pa;
+                pa.preserve<llvm::DominatorTreeAnalysis>();
+                pa.preserveSet<CFGAnalyses>();
+                return pa;
+            }
+        }
+    };
+
+    struct ArrayOptLegacy : public FunctionPass, public JuliaPassContext {
         static char ID;
-        Optimizer optimizer;
-        ArrayOpt() : FunctionPass(ID), optimizer(this) {
+        ArrayOptLegacy() : FunctionPass(ID) {
             llvm::initializeDominatorTreeWrapperPassPass(*PassRegistry::getPassRegistry());
         }
         bool runOnFunction(Function &F) override {
-            optimizer.initializeAllocations(F);
-            bool propagation_changed = optimizer.propagate1DArrayLengths();
-            //Propagating 1D array allocations may allow more cmp insts to be folded
-            bool cmp_folded = optimizer.optimizeCmpInsts();
-            return propagation_changed || cmp_folded;
+            initAll(*F.getParent());
+            auto dtree_getter = [&]() -> decltype(auto) { return getAnalysis<DominatorTreeWrapperPass>().getDomTree(); };
+            Optimizer<decltype(dtree_getter)> optimizer(jl_alloc::EscapeAnalysisRequiredArgs::Intrinsics(*this), dtree_getter);
+            return optimizer.runOnFunction(F);
         }
         void getAnalysisUsage(AnalysisUsage &AU) const override
         {
@@ -75,7 +95,8 @@ namespace {
         }
     };
 
-    void Optimizer::initializeAllocations(Function &F) {
+    template<typename DomTreeGetter>
+    void Optimizer<DomTreeGetter>::initializeAllocations(Function &F) {
         reset();
         jl_alloc::AllocIdInfo info;
         DL = &F.getParent()->getDataLayout();
@@ -94,13 +115,14 @@ namespace {
         }
     }
 
-    bool Optimizer::propagate1DArrayLengths() {
+    template<typename DomTreeGetter>
+    bool Optimizer<DomTreeGetter>::propagate1DArrayLengths() {
         bool changed = false;
         jl_alloc::AllocUseInfo use_info;
         jl_alloc::CheckInst::Stack check_stack;
         for (auto &allocation : array_allocations) {
             if (allocation.dimcount == 1) {
-                jl_alloc::EscapeAnalysisRequiredArgs args{use_info, check_stack, *pass, *DL};
+                jl_alloc::EscapeAnalysisRequiredArgs args{use_info, check_stack, intrinsics, *DL};
                 jl_alloc::runEscapeAnalysis(allocation.allocation, args);
                 if (use_info.escaped) {
                     continue;
@@ -146,9 +168,9 @@ namespace {
         return changed;
     }
 
-    bool Optimizer::optimizeCmpInsts() {
+    template<typename DomTreeGetter>
+    bool Optimizer<DomTreeGetter>::optimizeCmpInsts() {
         bool changed = false;
-        auto &dtree = pass->getAnalysis<DominatorTreeWrapperPass>().getDomTree();
         std::map<Value *, SmallSet<std::size_t, 2>> checked, next_check;
         SmallVector<std::pair<CmpInst*, bool>, 4> to_rauw;
         while (!lengths.empty()) {
@@ -156,7 +178,7 @@ namespace {
                 auto get_dominators = [&](Instruction *inst) {
                     llvm::SmallSet<std::size_t, 2> dominators;
                     for (auto idx : dim.second) {
-                        if (dtree.dominates(array_allocations[idx].allocation, inst)) {
+                        if (get_dtree().dominates(array_allocations[idx].allocation, inst)) {
                             dominators.insert(idx);
                         }
                     }
@@ -300,17 +322,15 @@ namespace {
         return changed;
     }
 
-    char ArrayOpt::ID = 0;
-    static RegisterPass<ArrayOpt> X("ArrayOpt", "1D array length propagation and array length unsignedness",
+    char ArrayOptLegacy::ID = 0;
+    static RegisterPass<ArrayOptLegacy> X("ArrayOpt", "1D array length propagation and array length unsignedness",
                                     false /* Only looks at CFG */,
                                     false /* Analysis Pass */);
-}
-
-
+} // namespace
 
 Pass *createArrayOptPass()
 {
-    return new ArrayOpt();
+    return new ArrayOptLegacy();
 }
 
 extern "C" JL_DLLEXPORT void LLVMExtraAddArrayOptPass_impl(LLVMPassManagerRef PM)

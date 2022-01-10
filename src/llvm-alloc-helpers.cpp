@@ -141,6 +141,18 @@ JL_USED_FUNC void AllocUseInfo::dump()
     }
 }
 
+jl_alloc::EscapeAnalysisRequiredArgs::Intrinsics::Intrinsics(JuliaPassContext &pass):
+        gc_preserve_begin_func(pass.gc_preserve_begin_func),
+        pointer_from_objref_func(pass.pointer_from_objref_func),
+        typeof_func(pass.typeof_func),
+        write_barrier_func(pass.write_barrier_func) {}
+
+jl_alloc::EscapeAnalysisRequiredArgs::Intrinsics::Intrinsics(Module &M):
+    gc_preserve_begin_func(M.getFunction("llvm.julia.gc_preserve_begin")),
+    pointer_from_objref_func(M.getFunction("julia.pointer_from_objref")),
+    typeof_func(M.getFunction("julia.typeof")),
+    write_barrier_func(M.getFunction("julia.write_barrier")) {}
+
 void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArgs required, EscapeAnalysisOptionalArgs options) {
     required.use_info.reset();
     if (I->use_empty())
@@ -188,7 +200,7 @@ void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArg
                     required.use_info.addrescaped = true;
                     return true;
                 }
-                if (required.pass.gc_preserve_begin_func == callee) {
+                if (required.intrinsics.gc_preserve_begin_func == callee) {
                     for (auto user: call->users())
                         required.use_info.uses.insert(cast<Instruction>(user));
                     required.use_info.preserves.insert(call);
@@ -196,16 +208,16 @@ void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArg
                     return true;
                 }
             }
-            if (required.pass.pointer_from_objref_func == callee) {
+            if (required.intrinsics.pointer_from_objref_func == callee) {
                 required.use_info.addrescaped = true;
                 return true;
             }
-            if (required.pass.typeof_func == callee) {
+            if (required.intrinsics.typeof_func == callee) {
                 required.use_info.hastypeof = true;
                 assert(use->get() == I);
                 return true;
             }
-            if (required.pass.write_barrier_func == callee)
+            if (required.intrinsics.write_barrier_func == callee)
                 return true;
             auto opno = use->getOperandNo();
             // Uses in `jl_roots` operand bundle are not counted as escaping, everything else is.
