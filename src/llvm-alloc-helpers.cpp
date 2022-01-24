@@ -302,3 +302,48 @@ void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArg
         }
     }
 }
+//We use metadata installed during codegen to identify array allocations
+//This is because codegen creates naked function pointer calls and thus
+//strips the identifying information about what the underlying function
+//actually is, so we need codegen to pass along the lost information.
+bool jl_alloc::getArrayAllocInfo(AllocIdInfo &info, llvm::CallInst *call) {
+    if (auto md = call->getMetadata("julia.array")) {
+        if (md->getNumOperands() == 1) {
+            if (auto mds = dyn_cast<MDString>(md->getOperand(0).get())) {
+                if (mds->getString() == "allocation") {
+                    info.isarray = true;
+                    info.array.dimcount = call->arg_size() - 1;
+                    return true;
+                } else if (mds->getString() == "allocation.dyn") {
+                    info.isarray = true;
+                    info.array.dimcount = 0;
+                    return true;
+                } else {
+                    assert(false && "Expected julia.array metadata to be either 'allocation' or 'allocation.dyn'!");
+                }
+            }
+        }
+        assert(false && "Expected julia.array metadata to have one string operand!");
+    }
+    return false;
+}
+
+bool jl_alloc::getAllocIdInfo(AllocIdInfo &info, llvm::CallInst *call, llvm::Function *alloc_obj_func) {
+    auto callee = call->getCalledOperand();
+    if (callee == alloc_obj_func) {
+        info.isarray = false;
+        auto sz = call->getArgOperand(1);
+        info.type = call->getArgOperand(2);
+        if (auto size = dyn_cast<ConstantInt>(sz)) {
+            info.object.size = size->getZExtValue();
+            if (info.object.size < IntegerType::MAX_INT_BITS / 8 && info.object.size < INT32_MAX) {
+                return true;
+            }
+        }
+        info.object.size = -1;
+        return true;
+    } else {
+        return getArrayAllocInfo(info, call);
+    }
+    return false;
+}
