@@ -348,3 +348,65 @@ bool jl_alloc::getAllocIdInfo(AllocIdInfo &info, llvm::CallInst *call, llvm::Fun
     }
     return false;
 }
+
+void jl_alloc::getArrayType(ArrayTypeData &array_type_data, CallInst *orig, jl_alloc::AllocIdInfo &info) {
+    array_type_data.reset();
+    if (info.array.dimcount == 0) {
+        array_type_data.dynamic_size = true;
+        return;
+    }
+    array_type_data.numels = 1;
+    for (int i = 0; i < info.array.dimcount; i++) {
+        if (auto cint = dyn_cast<ConstantInt>(orig->getArgOperand(i + 1))) {
+            if (cint->isNegative()) {
+                array_type_data.throws_invalid_dims = true;
+                return;
+            } else {
+                array_type_data.numels *= cint->getZExtValue();
+                if (array_type_data.numels > ArrayTypeData::MAX_SIZE) {
+                    array_type_data.throws_invalid_dims = true;
+                    return;
+                }
+            }
+        } else {
+            array_type_data.dynamic_size = true;
+        }
+    }
+    if (auto ce = dyn_cast<ConstantExpr>(info.type->stripPointerCasts())) {
+        if (ce->getOpcode() == Instruction::IntToPtr) {
+            if (auto ci = dyn_cast<ConstantInt>(ce->getOperand(0))) {
+                array_type_data.atype = reinterpret_cast<jl_value_t*>(ci->getZExtValue());
+                if (!array_type_data.dynamic_size) {
+                    array_type_data.eltype = jl_tparam0(array_type_data.atype);
+                    array_type_data.elsz = 0;
+                    array_type_data.align = 0;
+                    array_type_data.isunboxed = jl_islayout_inline(array_type_data.eltype, &array_type_data.elsz, &array_type_data.align);
+                    if (array_type_data.isunboxed) {
+                        array_type_data.elsz = LLT_ALIGN(array_type_data.elsz, array_type_data.align);
+                        array_type_data.align = std::min(array_type_data.elsz, alignof(std::max_align_t));
+                    } else {
+                        array_type_data.elsz = sizeof(void*);
+                        array_type_data.align = array_type_data.elsz;
+                    }
+                    array_type_data.isunion = jl_is_uniontype(array_type_data.eltype);
+                    array_type_data.total_size = array_type_data.elsz * array_type_data.numels;
+                    array_type_data.throws_invalid_size = array_type_data.total_size > ArrayTypeData::MAX_SIZE;
+                    if (array_type_data.throws_invalid_size) {
+                        return;
+                    }
+                    if (array_type_data.isunboxed) {
+                        if (array_type_data.isunion) {
+                            array_type_data.total_size += array_type_data.numels;
+                        } else if (array_type_data.elsz == 1) {
+                            array_type_data.total_size++;
+                        }
+                    }
+                    array_type_data.hasptr = array_type_data.isunboxed && (jl_is_datatype(array_type_data.eltype) && ((jl_datatype_t*)array_type_data.eltype)->layout->npointers > 0);
+                    array_type_data.zeroinit = !array_type_data.isunboxed || array_type_data.hasptr || array_type_data.isunion || (jl_is_datatype(array_type_data.eltype) && ((jl_datatype_t*)array_type_data.eltype)->zeroinit);
+                    return;
+                }
+            }
+        }
+    }
+    array_type_data.dynamic_type = true;
+}

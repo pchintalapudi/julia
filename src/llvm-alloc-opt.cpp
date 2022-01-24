@@ -136,10 +136,11 @@ private:
     void insertLifetime(Value *ptr, Constant *sz, Instruction *orig);
 
     void checkObjectEscapes(Instruction *I);
+    bool checkArrayEscapes(Instruction *I);
 
     void replaceIntrinsicUseWith(IntrinsicInst *call, Intrinsic::ID ID,
                                  Instruction *orig_i, Instruction *new_i);
-    void removeAlloc(CallInst *orig_inst, llvm::Value *tag);
+    void removeAlloc(CallInst *orig_inst, llvm::Value *tag, bool array = false);
     void moveToStack(CallInst *orig_inst, llvm::Value *tag, size_t sz, bool has_ref);
     void splitOnStack(CallInst *orig_inst, llvm::Value *tag);
     void optimizeTag(CallInst *orig_inst, llvm::Value *tag);
@@ -225,8 +226,36 @@ void Optimizer::optimizeArray(CallInst *orig, jl_alloc::AllocIdInfo &info) {
     if (object_escape_info.escaped) {
         return;
     }
+    jl_alloc::ArrayTypeData typeinfo;
+    jl_alloc::getArrayType(typeinfo, orig, info);
+    //This is going to error anyways, definitely don't bother optimizing
+    if (typeinfo.throws_invalid_dims || typeinfo.throws_invalid_size) {
+        //TODO consider adding some metadata here identifying this and dealing
+        //with the consequences in a later pass?
+        return;
+    }
+    //We can't tell if it's going to throw or not, can't optimize here
+    if (typeinfo.dynamic_size || typeinfo.dynamic_type) {
+        return;
+    }
     //Optimizations on coalescing and hoisting/sinking go here
     if (object_escape_info.haserror || object_escape_info.returned) {
+        return;
+    }
+    bool may_be_removable = !object_escape_info.addrescaped
+                            && (!object_escape_info.haspreserve || !object_escape_info.refstore);
+    //Totally dead array
+    if (may_be_removable && !object_escape_info.hasload) {
+        removeAlloc(orig, info.type);
+        return;
+    }
+    bool only_data_pointer = checkArrayEscapes(orig);
+    if (array_escape_info.escaped) {
+        return;
+    }
+    if (may_be_removable && only_data_pointer
+        && !array_escape_info.hasload && !array_escape_info.refstore) {
+        removeAlloc(orig, info.type, true);
         return;
     }
 }
@@ -344,6 +373,25 @@ void Optimizer::checkObjectEscapes(Instruction *I)
     object_escape_info.reset();
     jl_alloc::EscapeAnalysisRequiredArgs required{object_escape_info, check_stack, pass, *pass.DL};
     jl_alloc::runEscapeAnalysis(I, required);
+}
+bool Optimizer::checkArrayEscapes(Instruction *I)
+{
+    array_escape_info.reset();
+    bool only_data_pointer = true;
+    jl_alloc::EscapeAnalysisRequiredArgs required{array_escape_info, check_stack, pass, *pass.DL};
+    for (auto &memop : object_escape_info.memops) {
+        for (auto &access : memop.second.accesses) {
+            if (access.offset == offsetof(jl_array_t, data)) {
+                jl_alloc::runEscapeAnalysis(access.inst, required);
+                assert(!array_escape_info.returned);
+                assert(!array_escape_info.haserror);
+                assert(!array_escape_info.hastypeof);
+            } else {
+                only_data_pointer = false;
+            }
+        }
+    }
+    return only_data_pointer;
 }
 
 void Optimizer::insertLifetimeEnd(Value *ptr, Constant *sz, Instruction *insert)
@@ -728,7 +776,7 @@ void Optimizer::moveToStack(CallInst *orig_inst, llvm::Value *tag, size_t sz, bo
 
 // This function should not erase any safepoint so that the lifetime marker can find and cache
 // all the original safepoints.
-void Optimizer::removeAlloc(CallInst *orig_inst, llvm::Value *tag)
+void Optimizer::removeAlloc(CallInst *orig_inst, llvm::Value *tag, bool array)
 {
     removed.push_back(orig_inst);
     auto simple_remove = [&] (Instruction *orig_i) {
@@ -794,6 +842,9 @@ void Optimizer::removeAlloc(CallInst *orig_inst, llvm::Value *tag)
         }
         else if (isa<AddrSpaceCastInst>(user) || isa<BitCastInst>(user) ||
                  isa<GetElementPtrInst>(user)) {
+            push_frame(user);
+        }
+        else if (array && isa<LoadInst>(user)) {
             push_frame(user);
         }
         else {
@@ -1162,8 +1213,6 @@ cleanup:
 bool AllocOpt::doInitialization(Module &M)
 {
     initAll(M);
-    if (!alloc_obj_func)
-        return false;
 
     DL = &M.getDataLayout();
 
@@ -1177,8 +1226,6 @@ bool AllocOpt::doInitialization(Module &M)
 
 bool AllocOpt::runOnFunction(Function &F)
 {
-    if (!alloc_obj_func)
-        return false;
     Optimizer optimizer(F, *this);
     optimizer.initialize();
     optimizer.optimizeAll();

@@ -11,6 +11,7 @@
 #include <utility>
 #include <map>
 
+#include "julia.h"
 #include "llvm-pass-helpers.h"
 
 namespace jl_alloc {
@@ -153,6 +154,52 @@ namespace jl_alloc {
 
     bool getArrayAllocInfo(AllocIdInfo &info, llvm::CallInst *call);
     bool getAllocIdInfo(AllocIdInfo &info, llvm::CallInst *call, llvm::Function *alloc_obj_func);
+
+    struct ArrayTypeData {
+        constexpr static auto MAX_SIZE = std::numeric_limits<ssize_t>::max();
+
+        jl_value_t *atype;
+        jl_value_t *eltype;
+        size_t numels;
+        size_t elsz;
+        size_t total_size;
+        size_t align;
+        bool throws_invalid_dims;
+        bool throws_invalid_size;
+        bool dynamic_type;
+        bool dynamic_size;
+        bool isunboxed;
+        bool isunion;
+        bool hasptr;
+        bool zeroinit;
+
+        void reset() {
+            atype = eltype = nullptr;
+            numels = elsz = total_size = align = 0;
+            throws_invalid_dims = throws_invalid_size = false;
+            dynamic_type = dynamic_size = false;
+            isunboxed = isunion = false;
+            hasptr = zeroinit = false;
+        }
+
+        void dump() {
+            jl_safe_printf("Array Size Info:\n");
+            jl_safe_printf("numels: %zd\n", numels);
+            jl_safe_printf("elsz: %zd\n", elsz);
+            jl_safe_printf("total_size: %zd\n", total_size);
+            jl_safe_printf("align: %zd\n", align);
+            jl_safe_printf("throws_invalid_dims: %d\n", throws_invalid_dims);
+            jl_safe_printf("throws_invalid_size: %d\n", throws_invalid_size);
+            jl_safe_printf("dynamic_type: %d\n", dynamic_type);
+            jl_safe_printf("dynamic_size: %d\n", dynamic_size);
+            jl_safe_printf("isunboxed: %d\n", isunboxed);
+            jl_safe_printf("isunion: %d\n", isunion);
+            jl_safe_printf("hasptr: %d\n", hasptr);
+            jl_safe_printf("zeroinit: %d\n", zeroinit);
+        }
+    };
+
+    void getArrayType(ArrayTypeData &array_type_data, llvm::CallInst *alloc, jl_alloc::AllocIdInfo &info);
 }
 
 
