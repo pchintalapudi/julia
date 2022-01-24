@@ -113,7 +113,6 @@ JL_USED_FUNC void AllocUseInfo::dump()
     jl_safe_printf("escaped: %d\n", escaped);
     jl_safe_printf("addrescaped: %d\n", addrescaped);
     jl_safe_printf("returned: %d\n", returned);
-    jl_safe_printf("haserror: %d\n", haserror);
     jl_safe_printf("hasload: %d\n", hasload);
     jl_safe_printf("haspreserve: %d\n", haspreserve);
     jl_safe_printf("hasunknownmem: %d\n", hasunknownmem);
@@ -127,6 +126,13 @@ JL_USED_FUNC void AllocUseInfo::dump()
         jl_safe_printf("Preserves: %d\n", (unsigned)preserves.size());
         for (auto inst: preserves) {
             llvm_dump(inst);
+        }
+    }
+    if (!errors.empty()) {
+        jl_safe_printf("Errors: %d\n", (unsigned)errors.size());
+        for (auto &error : errors) {
+            jl_safe_printf("  Error block:\n");
+            llvm_dump(error.first);
         }
     }
     if (!memops.empty()) {
@@ -212,7 +218,7 @@ void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArg
             if (!call->isBundleOperand(opno) ||
                 call->getOperandBundleForOperand(opno).getTagName() != "jl_roots") {
                 if (isa<UnreachableInst>(call->getParent()->getTerminator())) {
-                    required.use_info.haserror = true;
+                    required.use_info.errors[call->getParent()].insert(call);
                     return true;
                 }
                 required.use_info.escaped = true;

@@ -62,6 +62,7 @@ namespace jl_alloc {
     struct AllocUseInfo {
         llvm::SmallSet<llvm::Instruction*,16> uses;
         llvm::SmallSet<llvm::CallInst*,4> preserves;
+        std::map<llvm::BasicBlock *, llvm::SmallSet<llvm::CallInst*, 2>> errors;
         std::map<uint32_t,Field> memops;
         // Completely unknown use
         bool escaped:1;
@@ -85,8 +86,6 @@ namespace jl_alloc {
         bool hasunknownmem:1;
         // The object is returned
         bool returned:1;
-        // The object is used in an error function
-        bool haserror:1;
 
         void reset()
         {
@@ -99,9 +98,9 @@ namespace jl_alloc {
             hastypeof = false;
             hasunknownmem = false;
             returned = false;
-            haserror = false;
             uses.clear();
             preserves.clear();
+            errors.clear();
             memops.clear();
         }
         void dump();

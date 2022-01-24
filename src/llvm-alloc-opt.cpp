@@ -144,6 +144,10 @@ private:
     void moveToStack(CallInst *orig_inst, llvm::Value *tag, size_t sz, bool has_ref);
     void splitOnStack(CallInst *orig_inst, llvm::Value *tag);
     void optimizeTag(CallInst *orig_inst, llvm::Value *tag);
+    void sinkArrayToErrors(CallInst *orig_inst, size_t bytes);
+    void moveArrayToStack(CallInst *orig_inst, jl_alloc::ArrayTypeData &array_type_data, llvm::Value *tag, bool has_ref);
+    void fixupArrayAddrSpaces(CallInst *orig_inst, Instruction *arrayshell, Instruction *arraydata, bool has_ref);
+    void fixupAddrSpace(Instruction *orig_inst, Instruction *new_inst, bool has_ref);
 
     Function &F;
     AllocOpt &pass;
@@ -210,6 +214,10 @@ void Optimizer::pushInstruction(Instruction *I)
 void Optimizer::initialize()
 {
     for (auto &bb: F) {
+        if (isa<UnreachableInst>(bb.getTerminator())) {
+            //No point in analyzing allocations that lead to errors
+            continue;
+        }
         for (auto &I: bb) {
             pushInstruction(&I);
         }
@@ -226,6 +234,11 @@ void Optimizer::optimizeArray(CallInst *orig, jl_alloc::AllocIdInfo &info) {
     if (object_escape_info.escaped) {
         return;
     }
+    if (object_escape_info.refload) {
+        //This indicates a load from a
+        return;
+    }
+    assert(!object_escape_info.refstore);
     jl_alloc::ArrayTypeData typeinfo;
     jl_alloc::getArrayType(typeinfo, orig, info);
     //This is going to error anyways, definitely don't bother optimizing
@@ -239,11 +252,12 @@ void Optimizer::optimizeArray(CallInst *orig, jl_alloc::AllocIdInfo &info) {
         return;
     }
     //Optimizations on coalescing and hoisting/sinking go here
-    if (object_escape_info.haserror || object_escape_info.returned) {
+    if (object_escape_info.returned) {
         return;
     }
     bool may_be_removable = !object_escape_info.addrescaped
-                            && (!object_escape_info.haspreserve || !object_escape_info.refstore);
+                            && (!object_escape_info.haspreserve || !object_escape_info.refstore)
+                            && object_escape_info.errors.empty();
     //Totally dead array
     if (may_be_removable && !object_escape_info.hasload) {
         removeAlloc(orig, info.type);
@@ -258,6 +272,16 @@ void Optimizer::optimizeArray(CallInst *orig, jl_alloc::AllocIdInfo &info) {
         removeAlloc(orig, info.type, true);
         return;
     }
+    if (typeinfo.zeroinit) {
+        //No GC-tracked pointers for now
+        return;
+    }
+    if (typeinfo.total_size <= ARRAY_INLINE_NBYTES) {
+        if (!object_escape_info.errors.empty()) {
+            sinkArrayToErrors(orig, typeinfo.total_size);
+        }
+        moveArrayToStack(orig, typeinfo, info.type, false);
+    }
 }
 
 void Optimizer::optimizeObject(CallInst *orig, jl_alloc::AllocIdInfo &info) {
@@ -268,7 +292,7 @@ void Optimizer::optimizeObject(CallInst *orig, jl_alloc::AllocIdInfo &info) {
         return;
     }
     //Optimizations on coalescing and hoisting/sinking go here
-    if (object_escape_info.haserror || object_escape_info.returned) {
+    if (!object_escape_info.errors.empty() || object_escape_info.returned) {
         if (object_escape_info.hastypeof)
             optimizeTag(orig, info.type);
         return;
@@ -384,7 +408,7 @@ bool Optimizer::checkArrayEscapes(Instruction *I)
             if (access.offset == offsetof(jl_array_t, data)) {
                 jl_alloc::runEscapeAnalysis(access.inst, required);
                 assert(!array_escape_info.returned);
-                assert(!array_escape_info.haserror);
+                assert(array_escape_info.errors.empty());
                 assert(!array_escape_info.hastypeof);
             } else {
                 only_data_pointer = false;
@@ -1208,6 +1232,278 @@ cleanup:
             continue;
         PromoteMemToReg({slot.slot}, getDomTree());
     }
+}
+
+void Optimizer::moveArrayToStack(CallInst *orig_inst, jl_alloc::ArrayTypeData &array_type_data, llvm::Value *tag, bool has_ref) {
+    // We take a simple approach to moving arrays to the stack
+    // 1. Create the outer jl_array_t shell struct
+    // (copied here for convenience)
+    /* JL_EXTENSION typedef struct {
+        JL_DATA_TYPE
+        void *data;
+        size_t length;
+        jl_array_flags_t flags;
+        uint16_t elsize;  // element size including alignment (dim 1 memory stride)
+        uint32_t offset;  // for 1-d only. does not need to get big.
+        size_t nrows;
+        union {
+            // 1d
+            size_t maxsize;
+            // Nd
+            size_t ncols;
+        };
+        // other dim sizes go here for ndims > 2
+        // followed by alignment padding and inline data, or owner pointer
+    } jl_array_t; */
+    // 2. Populate each of the fields of the struct as if it had been allocated
+    // 3. Mark any load memops on the shell with invariant group metadata because all of the fields are constant
+    // 4. RAUW on orig_inst and delete orig_inst
+
+    // Step 0: setup
+    auto ndimwords = jl_array_ndimwords(orig_inst->arg_size() - 1);
+    IRBuilder<> array_builder(&*orig_inst->getFunction()->getEntryBlock().getFirstInsertionPt());
+    auto tsz = sizeof(jl_array_t) + ndimwords * sizeof(size_t);
+    //Needed for flags.pooled computation below
+    if (array_type_data.total_size >= ARRAY_CACHE_ALIGN_THRESHOLD)
+        tsz = LLT_ALIGN(tsz, JL_CACHE_BYTE_ALIGNMENT);
+    else if (array_type_data.isunboxed && array_type_data.elsz >= 4)
+        tsz = LLT_ALIGN(tsz, JL_SMALL_BYTE_ALIGNMENT);
+    // Step 1: array shell
+    auto arrayshellbacking = array_builder.CreateAlloca(pass.T_int8, ConstantInt::get(pass.T_size, sizeof(void*) + tsz));
+    arrayshellbacking->setAlignment(Align(alignof(jl_array_t)));
+    auto arrayshell = cast<Instruction>(array_builder.CreateInBoundsGEP(pass.T_int8, arrayshellbacking, ConstantInt::get(pass.T_size, sizeof(void*))));
+    arrayshell->takeName(orig_inst);
+    arrayshell->setDebugLoc(orig_inst->getDebugLoc());
+
+    //Step 1.5: array type tag
+    auto type_ptr = array_builder.CreatePointerCast(arrayshellbacking, PointerType::get(tag->getType(), 0));
+    array_builder.CreateAlignedStore(tag, type_ptr, Align(alignof(void*)));
+
+    //Step 2: initialize shell fields
+#define initialize(field, value) \
+    do { auto field = value; \
+    auto field##ptr = array_builder.CreatePointerCast(array_builder.CreateInBoundsGEP(pass.T_int8, arrayshell, ConstantInt::get(pass.T_size, offsetof(jl_array_t, field))), PointerType::get(field->getType(), 0), arrayshell->getName() + ("." #field ".ptr")); \
+    array_builder.CreateAlignedStore(field, field##ptr, Align(alignof(decltype(jl_array_t::field)))); } while (0)
+
+    // Step 2a: array data
+    auto arraydata = array_builder.CreateAlloca(pass.T_int8, ConstantInt::get(pass.T_size, array_type_data.total_size));
+    //TODO do we want to increase our alloca alignment to cache line size if it's big enough or not?
+    arraydata->setAlignment(Align(llvm::MinAlign(1, array_type_data.align)));
+    arraydata->setName(arrayshell->getName() + ".data");
+    if (array_type_data.zeroinit) {
+        array_builder.CreateMemSet(arraydata, Constant::getNullValue(pass.T_int8), arraydata->getArraySize(), arraydata->getAlign());
+    }
+    initialize(data, arraydata);
+    // Step 2b: length
+    initialize(length, ConstantInt::get(pass.T_size, array_type_data.numels));
+    // Step 2c: flags
+    jl_array_flags_t flags;
+    static_assert(sizeof(jl_array_flags_t) == sizeof(uint16_t), "Expected jl_array_flags_t to be a uint16_t!");
+    flags.how = 0; // Known b/c we only stack allocate arrays <= ARRAY_INLINE_NBYTES
+    flags.pooled = tsz + array_type_data.total_size <= GC_MAX_SZCLASS; // Unsure if this is actually needed
+    flags.ndims = orig_inst->arg_size() - 1;
+    flags.ptrarray = !array_type_data.isunboxed;
+    flags.hasptr = array_type_data.hasptr;
+    flags.isshared = false;
+    flags.isaligned = true;
+    uint16_t flagsint;
+    memcpy(&flagsint, &flags, sizeof(flags)); // TBAA-safe reinterpret
+    initialize(flags, ConstantInt::get(Type::getInt16Ty(orig_inst->getContext()), flagsint));
+    // Step 2d: elsize
+    initialize(elsize, ConstantInt::get(Type::getInt16Ty(orig_inst->getContext()), array_type_data.elsz));
+    // Step 2e: offset
+    initialize(offset, Constant::getNullValue(pass.T_int32));
+    // Step 2f: nrows
+    auto dim1 = array_builder.CreateIntCast(orig_inst->getArgOperand(1), pass.T_size, false);
+    initialize(nrows, dim1);
+    // Step 2g: maxsize/ncols
+    if (orig_inst->arg_size() == 2) {
+        initialize(maxsize, dim1);
+    } else {
+        initialize(ncols, array_builder.CreateIntCast(orig_inst->getArgOperand(2), pass.T_size, false));
+    }
+    // Step 2h: dim3
+    if (orig_inst->arg_size() == 4) {
+        auto dim3 = array_builder.CreateIntCast(orig_inst->getArgOperand(3), pass.T_size, false);
+        auto dim3ptr = array_builder.CreatePointerCast(array_builder.CreateInBoundsGEP(pass.T_int8, arrayshell, ConstantInt::get(pass.T_size, sizeof(jl_array_t))), PointerType::get(dim3->getType(), 0));
+        array_builder.CreateAlignedStore(dim3, dim3ptr, Align(alignof(size_t)));
+    }
+#undef initialize
+
+    // Step 3: invariant group metadata
+    //TODO
+
+    // Step 4: RAUW and delete
+    //Fixup address spaces
+    fixupArrayAddrSpaces(orig_inst, arrayshell, arraydata, has_ref);
+    removeAlloc(orig_inst, tag, true);
+}
+
+// Replaces arraydata and fixes address spaces for arrayshell and arraydata to addrspace 0
+void Optimizer::fixupArrayAddrSpaces(CallInst *orig_inst, Instruction *arrayshell, Instruction *arraydata, bool has_ref) {
+    IRBuilder<> builder(orig_inst->getContext());
+    for (auto &memop : object_escape_info.memops) {
+        for (auto &access : memop.second.accesses) {
+            if (access.offset == 0) {
+                // This is a data pointer, will have addrspace 13
+                // Need to correct to addrspace 0
+                builder.SetInsertPoint(access.inst);
+                auto casted = builder.CreatePointerCast(arraydata, PointerType::get(cast<PointerType>(access.inst->getType())->getElementType(), 0));
+                if (casted != arraydata) {
+                    casted->takeName(access.inst);
+                    cast<Instruction>(casted)->setDebugLoc(access.inst->getDebugLoc());
+                }
+                fixupAddrSpace(access.inst, cast<Instruction>(casted), has_ref);
+            }
+        }
+    }
+    fixupAddrSpace(orig_inst, arrayshell, has_ref);
+}
+
+void Optimizer::fixupAddrSpace(Instruction *orig_inst, Instruction *new_inst, bool has_ref) {
+    auto simple_replace = [&] (Instruction *orig_i, Instruction *new_i) {
+        if (orig_i->user_empty()) {
+            if (orig_i != orig_inst)
+                orig_i->eraseFromParent();
+            return true;
+        }
+        Type *orig_t = orig_i->getType();
+        Type *new_t = new_i->getType();
+        if (orig_t == new_t) {
+            orig_i->replaceAllUsesWith(new_i);
+            if (orig_i != orig_inst)
+                orig_i->eraseFromParent();
+            return true;
+        }
+        return false;
+    };
+    if (simple_replace(orig_inst, new_inst))
+        return;
+    assert(replace_stack.empty());
+    ReplaceUses::Frame cur{orig_inst, new_inst};
+    auto finish_cur = [&] () {
+        assert(cur.orig_i->user_empty());
+        if (cur.orig_i != orig_inst) {
+            cur.orig_i->eraseFromParent();
+        }
+    };
+    auto push_frame = [&] (Instruction *orig_i, Instruction *new_i) {
+        if (simple_replace(orig_i, new_i))
+            return;
+        replace_stack.push_back(cur);
+        cur = {orig_i, new_i};
+    };
+    // Both `orig_i` and `new_i` should be pointer of the same type
+    // but possibly different address spaces. `new_i` is always in addrspace 0.
+    auto replace_inst = [&] (Instruction *user) {
+        Instruction *orig_i = cur.orig_i;
+        Instruction *new_i = cur.new_i;
+        if (isa<LoadInst>(user) || isa<StoreInst>(user)) {
+            user->replaceUsesOfWith(orig_i, new_i);
+        }
+        else if (auto call = dyn_cast<CallInst>(user)) {
+            auto callee = call->getCalledOperand();
+            if (pass.pointer_from_objref_func == callee) {
+                call->replaceAllUsesWith(new_i);
+                call->eraseFromParent();
+                return;
+            }
+            // Also remove the preserve intrinsics so that it can be better optimized.
+            if (pass.gc_preserve_begin_func == callee) {
+                if (has_ref) {
+                    call->replaceUsesOfWith(orig_i, new_inst);
+                }
+                else {
+                    removeGCPreserve(call, orig_i);
+                }
+                return;
+            }
+            if (pass.write_barrier_func == callee) {
+                call->eraseFromParent();
+                return;
+            }
+            if (auto intrinsic = dyn_cast<IntrinsicInst>(call)) {
+                if (Intrinsic::ID ID = intrinsic->getIntrinsicID()) {
+                    replaceIntrinsicUseWith(intrinsic, ID, orig_i, new_i);
+                    return;
+                }
+            }
+            // remove from operand bundle
+            Value *replace = has_ref ? (Value*)new_inst : Constant::getNullValue(orig_i->getType());
+            user->replaceUsesOfWith(orig_i, replace);
+        }
+        else if (isa<AddrSpaceCastInst>(user) || isa<BitCastInst>(user)) {
+            auto cast_t = PointerType::get(cast<PointerType>(user->getType())->getElementType(),
+                                           0);
+            auto replace_i = new_i;
+            Type *new_t = new_i->getType();
+            if (cast_t != new_t) {
+                replace_i = new BitCastInst(replace_i, cast_t, "", user);
+                replace_i->setDebugLoc(user->getDebugLoc());
+                replace_i->takeName(user);
+            }
+            push_frame(user, replace_i);
+        }
+        else if (auto gep = dyn_cast<GetElementPtrInst>(user)) {
+            SmallVector<Value *, 4> IdxOperands(gep->idx_begin(), gep->idx_end());
+            auto new_gep = GetElementPtrInst::Create(gep->getSourceElementType(),
+                                                     new_i, IdxOperands,
+                                                     gep->getName(), gep);
+            new_gep->setIsInBounds(gep->isInBounds());
+            new_gep->takeName(gep);
+            new_gep->copyMetadata(*gep);
+            push_frame(gep, new_gep);
+        }
+        else {
+            abort();
+        }
+    };
+
+    while (true) {
+        replace_inst(cast<Instruction>(*cur.orig_i->user_begin()));
+        while (cur.orig_i->use_empty()) {
+            finish_cur();
+            if (replace_stack.empty())
+                return;
+            cur = replace_stack.back();
+            replace_stack.pop_back();
+        }
+    }
+}
+
+void Optimizer::sinkArrayToErrors(CallInst *orig, size_t bytes) {
+    //The array is now being allocated only at error sites
+    //Assuming we don't care about performance of errors,
+    //we can be rather wasteful in ensuring that the
+    //observable behavior of the program doesn't change
+    for (auto &bb : object_escape_info.errors) {
+        Instruction *insert = &*bb.first->getFirstInsertionPt();
+        IRBuilder<> builder(insert);
+        llvm::SmallVector<Value *, 4> args(orig->arg_begin(), orig->arg_end());
+        auto copy = builder.CreateCall(orig->getFunctionType(), orig->getCalledOperand(), args);
+        copy->setAttributes(orig->getAttributes());
+        copy->copyMetadata(*orig);
+        copy->setName(orig->getName());
+        //Not bothering with metadata here, it's going to be pointless once LLVM sees
+        //the original buffer being allocated on the stack and forwards the load
+        auto get_data_ptr = [&](Instruction *array, AddressSpace as) {
+            return builder.CreateAlignedLoad(PointerType::get(Type::getInt8Ty(array->getContext()), as),
+                    builder.CreateBitOrPointerCast(array,
+                        PointerType::get(PointerType::get(Type::getInt8Ty(array->getContext()), as),
+                            cast<PointerType>(array->getType())->getAddressSpace())),
+                    Align(alignof(void*)));
+        };
+        auto orig_data = get_data_ptr(orig, AddressSpace::Generic);
+        auto new_data = get_data_ptr(copy, AddressSpace::Loaded);
+        builder.CreateMemCpy(new_data, Align(1), orig_data, Align(1), ConstantInt::get(pass.T_size, bytes));
+        for (auto &inst : *bb.first) {
+            if (object_escape_info.uses.contains(&inst)) {
+                inst.replaceUsesOfWith(orig, copy);
+                object_escape_info.uses.erase(&inst);
+            }
+        }
+    }
+    object_escape_info.errors.clear();
 }
 
 bool AllocOpt::doInitialization(Module &M)
