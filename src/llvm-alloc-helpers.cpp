@@ -143,7 +143,6 @@ JL_USED_FUNC void AllocUseInfo::dump()
 }
 
 void jl_alloc::runEscapeAnalysis(llvm::Instruction *I, EscapeAnalysisRequiredArgs required, EscapeAnalysisOptionalArgs options) {
-    required.use_info.reset();
     if (I->use_empty())
         return;
     CheckInst::Frame cur{I, 0, I->use_begin(), I->use_end()};
@@ -313,10 +312,12 @@ bool jl_alloc::getArrayAllocInfo(AllocIdInfo &info, llvm::CallInst *call) {
                 if (mds->getString() == "allocation") {
                     info.isarray = true;
                     info.array.dimcount = call->arg_size() - 1;
+                    info.type = call->getArgOperand(0);
                     return true;
                 } else if (mds->getString() == "allocation.dyn") {
                     info.isarray = true;
                     info.array.dimcount = 0;
+                    info.type = call->getArgOperand(0);
                     return true;
                 } else {
                     assert(false && "Expected julia.array metadata to be either 'allocation' or 'allocation.dyn'!");

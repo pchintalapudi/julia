@@ -339,22 +339,9 @@ Instruction *Optimizer::getFirstSafepoint(BasicBlock *bb)
     return first;
 }
 
-ssize_t Optimizer::getGCAllocSize(Instruction *I)
-{
-    auto call = dyn_cast<CallInst>(I);
-    if (!call)
-        return -1;
-    if (call->getCalledOperand() != pass.alloc_obj_func)
-        return -1;
-    assert(call->arg_size() == 3);
-    size_t sz = (size_t)cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
-    if (sz < IntegerType::MAX_INT_BITS / 8 && sz < INT32_MAX)
-        return sz;
-    return -1;
-}
-
 void Optimizer::checkObjectEscapes(Instruction *I)
 {
+    object_escape_info.reset();
     jl_alloc::EscapeAnalysisRequiredArgs required{object_escape_info, check_stack, pass, *pass.DL};
     jl_alloc::runEscapeAnalysis(I, required);
 }
