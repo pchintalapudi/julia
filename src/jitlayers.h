@@ -205,7 +205,9 @@ private:
     struct OptSelLayerT : orc::IRLayer {
 
         template<size_t N>
-        OptSelLayerT(OptimizeLayerT (&optimizers)[N]) : orc::IRLayer(optimizers[0].getExecutionSession(), optimizers[0].getManglingOptions()), optimizers(optimizers), count(N) {
+        OptSelLayerT(OptimizeLayerT (&optimizers)[N])
+        :   orc::IRLayer(optimizers[0].getExecutionSession(), optimizers[0].getManglingOptions()),
+            optimizers(optimizers), count(N) {
             static_assert(N > 0, "Expected array with at least one optimizer!");
         }
 
@@ -215,6 +217,53 @@ private:
         OptimizeLayerT *optimizers;
         size_t count;
     };
+
+    struct JuliaCodeInst {
+        jl_code_instance_t *codeinst;
+        jl_code_info_t *src;
+        size_t world;
+        LLVMContext &context;
+    };
+
+    class JuliaASTLayerT {
+    private:
+    class JuliaCodeInstMaterializationUnit : public orc::MaterializationUnit {
+    public:
+        JuliaCodeInstMaterializationUnit(JuliaASTLayerT &L, JuliaCodeInst F) : orc::MaterializationUnit(L.getInterface(F)), L(L), F(F) {}
+
+        StringRef getName() const override {
+            return "JuliaCodeInstMaterializationUnit";
+        }
+
+        void materialize(std::unique_ptr<orc::MaterializationResponsibility> R) override {
+            L.emit(std::move(R), std::move(F));
+        }
+
+    private:
+        void discard(const orc::JITDylib &JD, const orc::SymbolStringPtr &Sym) override {
+            llvm_unreachable("Julia functions are not overridable");
+        }
+
+        JuliaASTLayerT &L;
+        JuliaCodeInst F;
+    };
+    public:
+        JuliaASTLayerT(orc::IRLayer &BaseLayer)
+            : BaseLayer(BaseLayer) {}
+
+        Error add(orc::ResourceTrackerSP RT, JuliaCodeInst F) {
+            return RT->getJITDylib().define(
+                std::make_unique<JuliaCodeInstMaterializationUnit>(*this, std::move(F)), RT);
+        }
+
+        void emit(std::unique_ptr<orc::MaterializationResponsibility> MR, JuliaCodeInst F); // TODO
+
+        orc::MaterializationUnit::Interface getInterface(JuliaCodeInst &F); // TODO
+
+    private:
+        orc::IRLayer &BaseLayer;
+    };
+
 
 public:
 
@@ -238,8 +287,8 @@ public:
     const DataLayout& getDataLayout() const;
     const Triple& getTargetTriple() const;
     size_t getTotalBytes() const;
-private:
     std::string getMangledName(StringRef Name);
+private:
     std::string getMangledName(const GlobalValue *GV);
 
     TargetMachine &TM;

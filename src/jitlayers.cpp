@@ -61,9 +61,13 @@ void jl_dump_llvm_opt_impl(void *s)
     dump_llvm_opt_stream = (JL_STREAM*)s;
 }
 
-static void jl_add_to_ee(std::unique_ptr<Module> m);
-static void jl_add_to_ee(std::unique_ptr<Module> &M, StringMap<std::unique_ptr<Module>*> &NewExports);
+static void jl_decorate_module(Module &m);
+static void validate_relocations(Module &m);
 static uint64_t getAddressForFunction(StringRef fname);
+
+//typename OnCompleteFunc = void(*)(std::unique_ptr<Module &>M)
+template<typename OnCompleteFunc>
+static void jl_merge_modules(std::unique_ptr<Module> &M, StringMap<std::unique_ptr<Module>*> &NewExports, OnCompleteFunc OnComplete);
 
 void jl_link_global(GlobalVariable *GV, void *addr)
 {
@@ -93,11 +97,13 @@ void jl_jit_globals(std::map<void *, GlobalVariable*> &globals)
 // and adds the result to the jitlayers
 // (and the shadow module),
 // and generates code for it
-static jl_callptr_t _jl_compile_codeinst(
+template<typename OnCompleteFunc>
+static jl_callptr_t _jl_commit_codeinst(
         jl_code_instance_t *codeinst,
         jl_code_info_t *src,
         size_t world,
-        LLVMContext &context)
+        LLVMContext &context,
+        OnCompleteFunc onComplete)
 {
     // caller must hold codegen_lock
     // and have disabled finalizers
@@ -123,7 +129,7 @@ static jl_callptr_t _jl_compile_codeinst(
         jl_compile_workqueue(emitted, params, CompilationPolicy::Default, context);
 
         if (params._shared_module)
-            jl_add_to_ee(std::unique_ptr<Module>(params._shared_module));
+            onComplete(std::unique_ptr<Module>(params._shared_module));
         StringMap<std::unique_ptr<Module>*> NewExports;
         StringMap<void*> NewGlobals;
         for (auto &global : params.globals) {
@@ -147,7 +153,8 @@ static jl_callptr_t _jl_compile_codeinst(
         for (auto &def : emitted) {
             // Add the results to the execution engine now
             std::unique_ptr<Module> &M = std::get<0>(def.second);
-            jl_add_to_ee(M, NewExports);
+            jl_merge_modules(M, NewExports, onComplete);
+            assert(!M);
         }
     }
     JL_TIMING(LLVM_MODULE_FINISH);
@@ -201,6 +208,14 @@ static jl_callptr_t _jl_compile_codeinst(
     return fptr;
 }
 
+static jl_callptr_t _jl_compile_codeinst(
+        jl_code_instance_t *codeinst,
+        jl_code_info_t *src,
+        size_t world,
+        LLVMContext &context) {
+    return _jl_commit_codeinst(codeinst, src, world, context, [](std::unique_ptr<Module> M){ jl_ExecutionEngine->addModule(std::move(M)); });
+}
+
 const char *jl_generate_ccallable(void *llvmmod, void *sysimg_handle, jl_value_t *declrt, jl_value_t *sigt, jl_codegen_params_t &params, LLVMContext &ctxt);
 
 // compile a C-callable alias
@@ -229,10 +244,10 @@ int jl_compile_extern_c_impl(LLVMModuleRef llvmmod, void *p, void *sysimg, jl_va
             jl_jit_globals(params.globals);
             assert(params.workqueue.empty());
             if (params._shared_module)
-                jl_add_to_ee(std::unique_ptr<Module>(params._shared_module));
+                jl_ExecutionEngine->addModule(std::unique_ptr<Module>(params._shared_module));
         }
         if (success && llvmmod == NULL)
-            jl_add_to_ee(std::unique_ptr<Module>(into));
+            jl_ExecutionEngine->addModule(std::unique_ptr<Module>(into));
     }
     if (jl_codegen_lock.count == 1 && measure_compile_time_enabled)
         jl_atomic_fetch_add_relaxed(&jl_cumulative_compile_time, (jl_hrtime() - compiler_start_time));
@@ -920,6 +935,7 @@ void JuliaOJIT::addGlobalMapping(StringRef Name, uint64_t Addr)
 
 void JuliaOJIT::addModule(std::unique_ptr<Module> M)
 {
+    jl_decorate_module(*M);
     JL_TIMING(LLVM_MODULE_FINISH);
     std::vector<std::string> NewExports;
     for (auto &F : M->global_values()) {
@@ -927,26 +943,7 @@ void JuliaOJIT::addModule(std::unique_ptr<Module> M)
             NewExports.push_back(getMangledName(F.getName()));
         }
     }
-#if !defined(JL_NDEBUG) && !defined(JL_USE_JITLINK)
-    // validate the relocations for M (not implemented for the JITLink memory manager yet)
-    for (Module::global_object_iterator I = M->global_objects().begin(), E = M->global_objects().end(); I != E; ) {
-        GlobalObject *F = &*I;
-        ++I;
-        if (F->isDeclaration()) {
-            if (F->use_empty())
-                F->eraseFromParent();
-            else if (!((isa<Function>(F) && isIntrinsicFunction(cast<Function>(F))) ||
-                       findUnmangledSymbol(F->getName()) ||
-                       SectionMemoryManager::getSymbolAddressInProcess(
-                           getMangledName(F->getName())))) {
-                llvm::errs() << "FATAL ERROR: "
-                             << "Symbol \"" << F->getName().str() << "\""
-                             << "not found";
-                abort();
-            }
-        }
-    }
-#endif
+    validate_relocations(*M);
     // TODO: what is the performance characteristics of this?
     cantFail(OptSelLayer.add(JD, orc::ThreadSafeModule(std::move(M), TSCtx)));
     // force eager compilation (for now), due to memory management specifics
@@ -1230,8 +1227,7 @@ void jl_jit_share_data(Module &M)
         GV->eraseFromParent();
 }
 
-static void jl_add_to_ee(std::unique_ptr<Module> m)
-{
+static void jl_decorate_module(Module &m) {
 #if defined(_CPU_X86_64_) && defined(_OS_WINDOWS_)
     // Add special values used by debuginfo to build the UnwindData table registration for Win64
     Type *T_uint32 = Type::getInt32Ty(m->getContext());
@@ -1247,17 +1243,40 @@ static void jl_add_to_ee(std::unique_ptr<Module> m)
     gvs[1]->setSection(".text");
     appendToCompilerUsed(*m, makeArrayRef((GlobalValue**)gvs, 2));
 #endif
-    jl_jit_share_data(*m);
-    assert(jl_ExecutionEngine);
-    jl_ExecutionEngine->addModule(std::move(m));
+    jl_jit_share_data(m);
 }
 
-static int jl_add_to_ee(
+static void validate_relocations(Module &m) {
+#if !defined(JL_NDEBUG) && !defined(JL_USE_JITLINK)
+    // validate the relocations for M (not implemented for the JITLink memory manager yet)
+    for (Module::global_object_iterator I = m.global_objects().begin(), E = m.global_objects().end(); I != E; ) {
+        GlobalObject *F = &*I;
+        ++I;
+        if (F->isDeclaration()) {
+            if (F->use_empty())
+                F->eraseFromParent();
+            else if (!((isa<Function>(F) && isIntrinsicFunction(cast<Function>(F))) ||
+                       jl_ExecutionEngine->findUnmangledSymbol(F->getName()) ||
+                       SectionMemoryManager::getSymbolAddressInProcess(
+                           jl_ExecutionEngine->getMangledName(F->getName())))) {
+                llvm::errs() << "FATAL ERROR: "
+                             << "Symbol \"" << F->getName().str() << "\""
+                             << "not found";
+                abort();
+            }
+        }
+    }
+#endif
+}
+
+template<typename OnCompleteFunc>
+static int jl_merge_modules(
         std::unique_ptr<Module> &M,
         StringMap<std::unique_ptr<Module>*> &NewExports,
         DenseMap<Module*, int> &Queued,
         std::vector<std::vector<std::unique_ptr<Module>*>> &ToMerge,
-        int depth)
+        int Depth,
+        OnCompleteFunc OnComplete)
 {
     // DAG-sort (post-dominator) the compile to compute the minimum
     // merge-module sets for linkage
@@ -1269,31 +1288,31 @@ static int jl_add_to_ee(
         if (Cycle)
             return Cycle;
         ToMerge.push_back({});
-        Cycle = depth;
+        Cycle = Depth;
     }
-    int MergeUp = depth;
+    int MergeUp = Depth;
     // Compute the cycle-id
     for (auto &F : M->global_objects()) {
         if (F.isDeclaration() && F.getLinkage() == GlobalValue::ExternalLinkage) {
             auto Callee = NewExports.find(F.getName());
             if (Callee != NewExports.end()) {
                 auto &CM = Callee->second;
-                int Down = jl_add_to_ee(*CM, NewExports, Queued, ToMerge, depth + 1);
-                assert(Down <= depth);
+                int Down = jl_merge_modules(*CM, NewExports, Queued, ToMerge, Depth + 1, OnComplete);
+                assert(Down <= Depth);
                 if (Down && Down < MergeUp)
                     MergeUp = Down;
             }
         }
     }
-    if (MergeUp == depth) {
+    if (MergeUp == Depth) {
         // Not in a cycle (or at the top of it)
         Queued.erase(M.get());
-        for (auto &CM : ToMerge.at(depth - 1)) {
-            assert(Queued.find(CM->get())->second == depth);
+        for (auto &CM : ToMerge.at(Depth - 1)) {
+            assert(Queued.find(CM->get())->second == Depth);
             Queued.erase(CM->get());
             jl_merge_module(M.get(), std::move(*CM));
         }
-        jl_add_to_ee(std::move(M));
+        OnComplete(std::move(M));
         MergeUp = 0;
     }
     else {
@@ -1301,8 +1320,8 @@ static int jl_add_to_ee(
         Queued[M.get()] = MergeUp;
         auto &Top = ToMerge.at(MergeUp - 1);
         Top.push_back(&M);
-        for (auto &CM : ToMerge.at(depth - 1)) {
-            assert(Queued.find(CM->get())->second == depth);
+        for (auto &CM : ToMerge.at(Depth - 1)) {
+            assert(Queued.find(CM->get())->second == Depth);
             Queued[CM->get()] = MergeUp;
             Top.push_back(CM);
         }
@@ -1311,12 +1330,13 @@ static int jl_add_to_ee(
     return MergeUp;
 }
 
-static void jl_add_to_ee(std::unique_ptr<Module> &M, StringMap<std::unique_ptr<Module>*> &NewExports)
+template<typename OnCompleteFunc>
+static void jl_merge_modules(std::unique_ptr<Module> &M, StringMap<std::unique_ptr<Module>*> &NewExports,
+    OnCompleteFunc OnComplete)
 {
     DenseMap<Module*, int> Queued;
     std::vector<std::vector<std::unique_ptr<Module>*>> ToMerge;
-    jl_add_to_ee(M, NewExports, Queued, ToMerge, 1);
-    assert(!M);
+    jl_merge_modules(M, NewExports, Queued, ToMerge, 1, OnComplete);
 }
 
 
