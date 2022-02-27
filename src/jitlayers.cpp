@@ -93,18 +93,15 @@ void jl_jit_globals(std::map<void *, GlobalVariable*> &globals)
     }
 }
 
-// this generates llvm code for the lambda info
-// and adds the result to the jitlayers
-// (and the shadow module),
-// and generates code for it
-template<typename OnCompleteFunc>
-static jl_callptr_t _jl_commit_codeinst(
-        jl_code_instance_t *codeinst,
+// We break up the codeinst compile to allow the AST layer
+// to reschedule downstream workqueue compilations at its
+// leisure
+static jl_partial_compile _jl_start_compile_codeinst(
+    jl_code_instance_t *codeinst,
         jl_code_info_t *src,
         size_t world,
-        LLVMContext &context,
-        OnCompleteFunc onComplete)
-{
+        LLVMContext &context
+) {
     // caller must hold codegen_lock
     // and have disabled finalizers
     uint64_t start_time = 0;
@@ -116,23 +113,27 @@ static jl_callptr_t _jl_commit_codeinst(
         "invalid world for method-instance");
     assert(src && jl_is_code_info(src));
 
-    jl_callptr_t fptr = NULL;
     // emit the code in LLVM IR form
     jl_codegen_params_t params;
     params.cache = true;
     params.world = world;
+    auto result = jl_emit_codeinst(codeinst, src, params, context);
+    return {codeinst, src, world, context, start_time, std::move(params), std::move(result)};
+}
+
+template<typename OnCompleteFunc>
+static jl_callptr_t _jl_finish_compile_codeinst(jl_partial_compile partial, OnCompleteFunc onComplete) {
     std::map<jl_code_instance_t*, jl_compile_result_t> emitted;
     {
-        jl_compile_result_t result = jl_emit_codeinst(codeinst, src, params, context);
-        if (std::get<0>(result))
-            emitted[codeinst] = std::move(result);
-        jl_compile_workqueue(emitted, params, CompilationPolicy::Default, context);
+        if (std::get<0>(partial.partial))
+            emitted[partial.codeinst] = std::move(partial.partial);
+        jl_compile_workqueue(emitted, partial.params, CompilationPolicy::Default, partial.context);
 
-        if (params._shared_module)
-            onComplete(std::unique_ptr<Module>(params._shared_module));
+        if (partial.params._shared_module)
+            onComplete(std::unique_ptr<Module>(partial.params._shared_module));
         StringMap<std::unique_ptr<Module>*> NewExports;
         StringMap<void*> NewGlobals;
-        for (auto &global : params.globals) {
+        for (auto &global : partial.params.globals) {
             NewGlobals[global.second->getName()] = global.first;
         }
         for (auto &def : emitted) {
@@ -159,6 +160,7 @@ static jl_callptr_t _jl_commit_codeinst(
     }
     JL_TIMING(LLVM_MODULE_FINISH);
 
+    jl_callptr_t fptr = NULL;
     for (auto &def : emitted) {
         jl_code_instance_t *this_code = def.first;
         jl_llvm_functions_t decls = std::get<1>(def.second);
@@ -187,7 +189,7 @@ static jl_callptr_t _jl_commit_codeinst(
             // hack to export this pointer value to jl_dump_method_disasm
             jl_atomic_store_release(&this_code->specptr.fptr, (void*)getAddressForFunction(decls.specFunctionObject));
         }
-        if (this_code== codeinst)
+        if (this_code== partial.codeinst)
             fptr = addr;
     }
 
@@ -197,10 +199,10 @@ static jl_callptr_t _jl_commit_codeinst(
 
     // If logging of the compilation stream is enabled,
     // then dump the method-instance specialization type to the stream
-    jl_method_instance_t *mi = codeinst->def;
+    jl_method_instance_t *mi = partial.codeinst->def;
     if (jl_is_method(mi->def.method)) {
         if (dump_compiles_stream != NULL) {
-            jl_printf(dump_compiles_stream, "%" PRIu64 "\t\"", end_time - start_time);
+            jl_printf(dump_compiles_stream, "%" PRIu64 "\t\"", end_time - partial.start_time);
             jl_static_show(dump_compiles_stream, mi->specTypes);
             jl_printf(dump_compiles_stream, "\"\n");
         }
@@ -208,12 +210,21 @@ static jl_callptr_t _jl_commit_codeinst(
     return fptr;
 }
 
+
+// this generates llvm code for the lambda info
+// and adds the result to the jitlayers
+// (and the shadow module),
+// and generates code for it
 static jl_callptr_t _jl_compile_codeinst(
         jl_code_instance_t *codeinst,
         jl_code_info_t *src,
         size_t world,
         LLVMContext &context) {
-    return _jl_commit_codeinst(codeinst, src, world, context, [](std::unique_ptr<Module> M){ jl_ExecutionEngine->addModule(std::move(M)); });
+    return _jl_finish_compile_codeinst(_jl_start_compile_codeinst(codeinst, src, world, context), [](std::unique_ptr<Module> M){ jl_ExecutionEngine->addModule(std::move(M)); });
+}
+
+void JuliaOJIT::JuliaASTLayerT::emit(std::unique_ptr<orc::MaterializationResponsibility> MR, jl_partial_compile partial) {
+    _jl_finish_compile_codeinst(std::move(partial), [&](std::unique_ptr<Module> M){ BaseLayer.emit(std::move(MR), orc::ThreadSafeModule(std::move(M), TSCtx)); });
 }
 
 const char *jl_generate_ccallable(void *llvmmod, void *sysimg_handle, jl_value_t *declrt, jl_value_t *sigt, jl_codegen_params_t &params, LLVMContext &ctxt);

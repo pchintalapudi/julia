@@ -179,6 +179,16 @@ typedef JITSymbol JL_SymbolInfo;
 using CompilerResultT = Expected<std::unique_ptr<llvm::MemoryBuffer>>;
 using OptimizerResultT = Expected<orc::ThreadSafeModule>;
 
+struct jl_partial_compile {
+    jl_code_instance_t *codeinst;
+    jl_code_info_t *src;
+    size_t world;
+    LLVMContext &context;
+    uint64_t start_time;
+    jl_codegen_params_t params;
+    jl_compile_result_t partial;
+};
+
 class JuliaOJIT {
 public:
 #ifdef JL_USE_JITLINK
@@ -218,18 +228,11 @@ private:
         size_t count;
     };
 
-    struct JuliaCodeInst {
-        jl_code_instance_t *codeinst;
-        jl_code_info_t *src;
-        size_t world;
-        LLVMContext &context;
-    };
-
     class JuliaASTLayerT {
     private:
     class JuliaCodeInstMaterializationUnit : public orc::MaterializationUnit {
     public:
-        JuliaCodeInstMaterializationUnit(JuliaASTLayerT &L, JuliaCodeInst F) : orc::MaterializationUnit(L.getInterface(F)), L(L), F(F) {}
+        JuliaCodeInstMaterializationUnit(JuliaASTLayerT &L, jl_partial_compile F) : orc::MaterializationUnit(L.getInterface(F)), L(L), F(std::move(F)) {}
 
         StringRef getName() const override {
             return "JuliaCodeInstMaterializationUnit";
@@ -245,23 +248,24 @@ private:
         }
 
         JuliaASTLayerT &L;
-        JuliaCodeInst F;
+        jl_partial_compile F;
     };
     public:
-        JuliaASTLayerT(orc::IRLayer &BaseLayer)
-            : BaseLayer(BaseLayer) {}
+        JuliaASTLayerT(orc::IRLayer &BaseLayer, orc::ThreadSafeContext &TSCtx)
+            : BaseLayer(BaseLayer), TSCtx(TSCtx) {}
 
-        Error add(orc::ResourceTrackerSP RT, JuliaCodeInst F) {
+        Error add(orc::ResourceTrackerSP RT, jl_partial_compile F) {
             return RT->getJITDylib().define(
                 std::make_unique<JuliaCodeInstMaterializationUnit>(*this, std::move(F)), RT);
         }
 
-        void emit(std::unique_ptr<orc::MaterializationResponsibility> MR, JuliaCodeInst F); // TODO
+        void emit(std::unique_ptr<orc::MaterializationResponsibility> MR, jl_partial_compile F); // TODO
 
-        orc::MaterializationUnit::Interface getInterface(JuliaCodeInst &F); // TODO
+        orc::MaterializationUnit::Interface getInterface(jl_partial_compile &F); // TODO
 
     private:
         orc::IRLayer &BaseLayer;
+        orc::ThreadSafeContext &TSCtx;
     };
 
 
